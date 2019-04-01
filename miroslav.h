@@ -8,6 +8,8 @@
 
 #include <immintrin.h>
 
+#define UNUSED __attribute__((unused))
+
 static inline uint32_t bsf64(uint64_t x) {
 	return __builtin_ctzll(x);
 }
@@ -191,11 +193,11 @@ public:
         _match_count = 0;
     }
 
-    void handle_match(File &f, const uint8_t *start, const uint8_t *end) {
+    void handle_match(UNUSED File &f, UNUSED const uint8_t *start, UNUSED const uint8_t *end) {
         _match_count++;
     }
 
-    return_type finish(File &f) {
+    return_type finish(UNUSED File &f) {
         return _match_count;
     }
 };
