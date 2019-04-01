@@ -355,7 +355,7 @@ public:
 
             vmask covered = end_m & trans_m;
             carry = last_carry + ((double_vmask)start_m << 1) + trans_m;
-            vmask matches = ~carry & covered;
+            vmask matches = ~(carry & ~start_m) & covered;
             // Check for 1-char matches
             matches |= has_1_char_match & start_m & end_m;
 
