@@ -24,6 +24,12 @@ static inline uint32_t bsf64(uint64_t x) {
 #define MAX_STATES (32)
 typedef uint32_t smask;
 
+// Wacky macro to make tuple unpacking a little less annoying
+#define FOR_EACH_EDGE(c, from, to, edges) \
+    for (auto edge_i = edges.begin(); \
+            edge_i != edges.end() ? (std::tie(c, from, to) = *edge_i), 1 : 0; \
+            edge_i++)
+
 ////////////////////////////////////////////////////////////////////////////////
 // Basic mmap wrapper for file handling
 ////////////////////////////////////////////////////////////////////////////////
@@ -86,6 +92,10 @@ struct VecInfoAVX2 {
 
     static inline V vec_and(V &a, V &b) {
         return _mm256_and_si256(a, b);
+    }
+
+    static inline V vec_shr(V &a, uint32_t shift) {
+        return _mm256_srli_epi32(a, shift);
     }
 
     static inline V vec_lanes_shl_1(V &top, V &bottom) {
@@ -262,7 +272,7 @@ public:
 ////////////////////////////////////////////////////////////////////////////////
 // Miroslav: the core SIMD string matching algorithm
 ////////////////////////////////////////////////////////////////////////////////
-template<typename VI, typename MatchVerifier, typename MatchHandler>
+template<typename VI, typename MatchVerifier, typename MatchHandler, const uint32_t SHIFTS[]>
 class _Miroslav {
     // Hacky substitute for "using"
     typedef typename VI::V V;
@@ -279,15 +289,17 @@ class _Miroslav {
         return 1 << (state % 6 + 1);
     }
 
-    static inline uint8_t char_mask(uint8_t c) {
-        return c & LMASK;
+    static inline uint8_t char_mask(uint8_t c, uint32_t shift) {
+        return (c >> shift) & LMASK;
     }
+
+    static const uint32_t N_SHIFTS = sizeof(SHIFTS) / sizeof(uint32_t);
 
     MatchVerifier match_verifier;
     MatchHandler &match_handler;
 
-    V from_states;
-    V to_states;
+    V from_states[N_SHIFTS];
+    V to_states[N_SHIFTS];
     V v_char_mask;
 
     // For branchless testing of whether a pattern has a 1-character match.
@@ -299,30 +311,31 @@ class _Miroslav {
 public:
     _Miroslav(std::vector<std::tuple<uint8_t, uint32_t, uint32_t>> &edges,
             MatchHandler &handler) : match_verifier(edges), match_handler(handler) {
-        uint8_t from_state_bytes[VL] = {0};
-        uint8_t to_state_bytes[VL] = {0};
+        uint8_t from_state_bytes[N_SHIFTS][VL] = {{0}};
+        uint8_t to_state_bytes[N_SHIFTS][VL] = {{0}};
 
         has_1_char_match = 0;
 
         // Initialize from/to state masks tables
-        for (auto edge : edges) {
-            uint8_t c;
-            uint32_t from, to;
-            std::tie(c, from, to) = edge;
-
-            from_state_bytes[char_mask(c)] |= state_mask(from);
-            to_state_bytes[char_mask(c)] |= state_mask(to);
+        uint8_t c;
+        uint32_t from, to;
+        FOR_EACH_EDGE(c, from, to, edges) {
+            for (uint32_t s = 0; s < N_SHIFTS; s++) {
+                from_state_bytes[s][char_mask(c, SHIFTS[s])] |= state_mask(from);
+                to_state_bytes[s][char_mask(c, SHIFTS[s])] |= state_mask(to);
+            }
 
             // Check for 1-character matches and update the mask
             if (from == START_STATE && to == END_STATE)
                 has_1_char_match = (vmask)-1;
         }
 
-        VI::prepare_state_table(from_state_bytes);
-        VI::prepare_state_table(to_state_bytes);
-
-        from_states = *(V*)from_state_bytes;
-        to_states = *(V*)to_state_bytes;
+        for (uint32_t s = 0; s < N_SHIFTS; s++) {
+            VI::prepare_state_table(from_state_bytes[s]);
+            VI::prepare_state_table(to_state_bytes[s]);
+            from_states[s] = *(V*)from_state_bytes[s];
+            to_states[s] = *(V*)to_state_bytes[s];
+        }
 
         v_char_mask = VI::broadcast(LMASK);
     }
@@ -330,15 +343,32 @@ public:
     typename MatchHandler::return_type run(File &f) {
         match_handler.start();
 
-        double_vmask carry, last_carry = 0;
+        double_vmask carry;
+        vmask last_carry = 0;
         V last_to = VI::broadcast(state_mask(START_STATE));
 
         const uint8_t *chunk;
         for (chunk = f.data; chunk + VL <= f.data + f.size; chunk += VL) {
-            V masked_input = VI::vec_and(*(V*)chunk, v_char_mask);
+            V input = *(V*)chunk;
 
-            V from = VI::permute(from_states, masked_input);
-            V to = VI::permute(to_states, masked_input);
+            V from;
+            V to;
+            for (uint32_t s = 0; s < N_SHIFTS; s++) {
+                V masked_input = input;
+                if (SHIFTS[s])
+                    masked_input = VI::vec_shr(masked_input, SHIFTS[s]);
+                masked_input = VI::vec_and(masked_input, v_char_mask);
+
+                V f = VI::permute(from_states[s], masked_input);
+                V t = VI::permute(to_states[s], masked_input);
+                if (s == 0) {
+                    from = f;
+                    to = t;
+                } else {
+                    from = VI::vec_and(from, f);
+                    to = VI::vec_and(to, t);
+                }
+            }
 
             // Get a vector of the to states, but shifted back in the data
             // stream by 1 byte. We fill the empty space in the first lane with
@@ -389,5 +419,6 @@ public:
 };
 
 // Template alias using VEC_INFO class defined in the Makefile
+static constexpr uint32_t SHIFTS[] = {0, 3};
 template <typename MatchHandler>
-using Miroslav = _Miroslav<VEC_INFO, BasicMatchVerifier<true>, MatchHandler>;
+using Miroslav = _Miroslav<VEC_INFO, BasicMatchVerifier<true>, MatchHandler, SHIFTS>;
