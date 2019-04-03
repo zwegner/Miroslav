@@ -11,6 +11,8 @@
 
 #define UNUSED __attribute__((unused))
 
+#define EXPECT(x, v)     __builtin_expect((x), (v))
+
 static inline uint32_t bsf64(uint64_t x) {
 	return __builtin_ctzll(x);
 }
@@ -97,12 +99,14 @@ struct VecInfoAVX2 {
     }
 
     static inline V vec_lanes_shl_1(V &top, V &bottom) {
-        // Jumble the masks around, including the last state mask, so we can
-        // compare consecutive bytes. The permute takes [last_H, last_L] and
-        // [to_H, to_L] and gives us [to_L, last_H]. This is like the "to"
-        // vector shifted back in time 16 bytes, so we can use it with valign
-        // back 15 bytes, giving us a net shift of just 1 byte.
-        V shl_16 = _mm256_permute2f128_si256(top, bottom, 0x03);
+        // Move all the vector lanes in "top" to the left by one and fill
+        // in the first lane with the last lane in "bottom". Since AVX2
+        // generally works on two separate 16-byte vectors glued together,
+        // this needs two steps. The permute takes [bottom_H, bottom_L]
+        // and [top_H, top_L] and gives us [top_L, bottom_H]. The align then
+        // takes [top_H, top_L] and gives us [top_H[1:], top_L[:1]], and
+        // takes [top_L, bottom_H] and gives us [top_L[1:], bottom_H[:1]].
+        V shl_16 = _mm256_permute2x128_si256(top, bottom, 0x03);
         return _mm256_alignr_epi8(top, shl_16, 15);
     }
 
@@ -116,8 +120,7 @@ struct VecInfoAVX2 {
     }
 
     static inline vmask test_nz(V &a) {
-        static V vzero = broadcast(0);
-        return ~_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vzero));
+        return ~_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, _mm256_setzero_si256()));
     }
 
     static void prepare_state_table(uint8_t state_bytes[VL]) {
@@ -505,12 +508,12 @@ public:
             // Look through the bitset of all potential matches, and run a
             // backwards verification step to weed out false positives. Any
             // real matches we pass off to the match handler.
-            while (matches) {
+            while (EXPECT(matches, 0)) {
                 const uint8_t *end = chunk + bsf64(matches);
                 matches &= matches - 1;
 
                 const uint8_t *start = match_verifier.verify(f.data, end);
-                if (start)
+                if (EXPECT(start != NULL, 0))
                     match_handler.handle_match(f, start, end);
             }
         }
@@ -518,10 +521,10 @@ public:
         // Run the slow backwards NFA on all the remainder bytes that don't fit
         // in a vector register. We could probably read past the original
         // buffer or do an unaligned read or something, but oh well.
-        for (; chunk < f.data + f.size; chunk++) {
-            const uint8_t *start = match_verifier.verify(f.data, chunk);
+        for (const uint8_t *end = chunk; end < f.data + f.size; end++) {
+            const uint8_t *start = match_verifier.verify(f.data, end);
             if (start)
-                match_handler.handle_match(f, start, chunk);
+                match_handler.handle_match(f, start, end);
         }
 
         return match_handler.finish(f);
