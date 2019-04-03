@@ -40,7 +40,6 @@ int main(int argc, char **argv) {
 
     // Parse the input regex
     std::string pattern(argv[0]);
-    char sep = '|';
     if (!strcmp(argv[0], "-f")) {
         EAT_ARG();
         std::ifstream f(argv[0]);
@@ -48,7 +47,6 @@ int main(int argc, char **argv) {
         std::stringstream buffer;
         buffer << f.rdbuf();
         pattern = buffer.str();
-        sep = '\n';
     } else {
         pattern = std::string(argv[0]);
         EAT_ARG();
@@ -65,7 +63,7 @@ int main(int argc, char **argv) {
     for (uint32_t i = 0; i < pattern.length(); i++) {
         auto c = pattern[i];
 
-        if (c == sep) {
+        if (c == '|' || c == '\n') {
             last_state = START_STATE;
             can_be_duplicate = true;
         } else {
@@ -80,7 +78,8 @@ int main(int argc, char **argv) {
                 } else
                     can_be_duplicate = false;
             }
-            if (i < pattern.length() - 1 && pattern[i + 1] != sep) {
+            if (i < pattern.length() - 1 && pattern[i + 1] != '|' &&
+                    pattern[i + 1] != '\n') {
                 edges.push_back(std::make_tuple(c, last_state, state));
                 edge_map[edge_key(c, last_state)] = state;
                 last_state = state;
