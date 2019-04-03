@@ -123,6 +123,10 @@ struct VecInfoAVX2 {
         return ~_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, _mm256_setzero_si256()));
     }
 
+    static inline vmask test_eq(V &a, V &b) {
+        return _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b));
+    }
+
     static void prepare_state_table(uint8_t state_bytes[VL]) {
         // HACK because AVX2 sucks and can only do 16-byte shuffles
         for (uint32_t i = 0; i < 16; i++)
@@ -229,6 +233,151 @@ struct StateInfo128 {
 typedef BasicMatchVerifier<StateInfo32> BasicMatchVerifier32;
 typedef BasicMatchVerifier<StateInfo64> BasicMatchVerifier64;
 typedef BasicMatchVerifier<StateInfo128> BasicMatchVerifier128;
+
+template<class VI>
+class SIMDMatchVerifier {
+    // Hacky substitute for "using"
+    typedef typename VI::V V;
+    typedef typename VI::vmask vmask;
+    static const uint32_t VL = VI::VL;
+
+    uint8_t byte_count[256];
+    uint8_t *edge_keys[256];
+    uint8_t *edge_values[256];
+
+public:
+    SIMDMatchVerifier(NFAEdgeList &edges) {
+        // Group NFA edges into vectors by character
+        struct kv_pair {
+            uint8_t k, v;
+            kv_pair(uint8_t k, uint8_t v) : k(k), v(v) { }
+        };
+        std::vector<struct kv_pair> edge_pairs[256];
+        uint8_t c;
+        uint32_t from, to;
+        FOR_EACH_EDGE(c, from, to, edges) {
+            // We use 255 as a sentinel value, so can only use 254 real states
+            assert(from < 255);
+            assert(to < 255);
+            edge_pairs[c].push_back(kv_pair(to, from));
+        }
+
+        for (uint32_t i = 0; i < 256; i++) {
+            // Sort the vector so all states that a given state/character combination
+            // can lead to are all contiguous
+            std::stable_sort(edge_pairs[i].begin(), edge_pairs[i].end(),
+                    [](const auto& a, const auto& b) { return a.k < b.k; });
+
+            if (edge_pairs[i].size() == 0) {
+                edge_keys[i] = edge_values[i] = NULL;
+                byte_count[i] = 0;
+                continue;
+            }
+
+            // Add VL bytes and clear the low bits (x & -VL rounds x down to the
+            // nearest multiple of VL) to get the number of bytes we will store
+            // the keys/values in. We add VL to round up, but also multiples of VL
+            // round up to the next multiple, so we always get at least one
+            // extra slot. That way we can just compare states in a loop while
+            // ignoring the array length (since we're storing 255s at the end of
+            // the table that will always compare false).
+            byte_count[i] = (edge_pairs[i].size() + VL) & -VL;
+            edge_keys[i] = (uint8_t *)malloc(byte_count[i]);
+            edge_values[i] = (uint8_t *)malloc(byte_count[i]);
+
+            // Copy the sorted vector into the key/value lists, filling in the
+            // rest of the values with 255
+            uint32_t j;
+            for (j = 0; j < edge_pairs[i].size(); j++) {
+                edge_keys[i][j] = edge_pairs[i][j].k;
+                edge_values[i][j] = edge_pairs[i][j].v;
+            }
+            for (; j < byte_count[i]; j++) {
+                edge_keys[i][j] = 255;
+                edge_values[i][j] = 255;
+            }
+        }
+    }
+
+    ~SIMDMatchVerifier() {
+        for (uint32_t i = 0; i < 256; i++) {
+            if (byte_count[i]) {
+                free(edge_keys[i]);
+                free(edge_values[i]);
+            }
+        }
+    }
+
+    const uint8_t *verify(const uint8_t *data, const uint8_t *end) {
+        // We have two state lists and switch between them like double buffering.
+        // We keep a pointer to the current and next states, which we swap each
+        // iteration.
+        uint8_t _states[2][256];
+        uint32_t _n_states[2];
+        uint8_t *states = _states[0], *next_states = _states[1];
+        uint32_t *n_states = &_n_states[0], *next_n_states = &_n_states[1];
+
+        *n_states = 1;
+        states[0] = END_STATE;
+        uint8_t c = *end;
+        do {
+            *next_n_states = 0;
+            uint64_t seen = 0;
+            for (uint32_t s = 0; s < *n_states; s++) {
+                uint8_t state = states[s];
+                V state_vec = VI::broadcast(state);
+                for (uint32_t i = 0; i < byte_count[c]; i += VL) {
+                    // Load VL contiguous key bytes into one vector, and
+                    // compare the current state against all of them at once
+                    auto key = *(V *)&edge_keys[c][i];
+                    vmask eq = VI::test_eq(key, state_vec);
+
+                    // If there was a match, there might be multiple
+                    // predecessor states from this state/input byte. Since
+                    // we sort the keys, we can just get the index of the
+                    // first match with bsf, and loop while the keys match.
+                    if (EXPECT(eq, 0)) {
+                        for (uint32_t x = bsf64(eq) + i; edge_keys[c][x] == state; x++) {
+                            auto ns = edge_values[c][x];
+
+                            // Check for reaching the start state, and return immediately
+                            if (ns == START_STATE)
+                                return end;
+
+                            // Do a quick check for if we've already added this
+                            // state by testing a mask against the low 6 bits
+                            // of the state id, followed by a full slow check.
+                            // XXX relies on variable shifts only looking at the low
+                            // 6 bits
+                            uint64_t mask = (uint64_t)1 << ns;
+                            if (EXPECT(seen & mask, 0)) {
+                                // XXX even this check could be vectorized, or at least
+                                // SWAR-ized
+                                for (uint32_t s2 = 0; s2 < *next_n_states; s2++)
+                                    if (next_states[s2] == ns)
+                                        goto skip;
+                            } else
+                                seen |= mask;
+
+                            next_states[(*next_n_states)++] = ns;
+skip:
+                            ;
+                        }
+                    }
+                }
+            }
+            std::swap(states, next_states);
+            std::swap(n_states, next_n_states);
+        }
+        // Kinda tricky do/while loop condition: make sure there are still active
+        // NFA states, advance the pointer backwards, make sure it's still in
+        // bounds, read the next byte, and make sure there are predecessor states
+        // for that input byte
+        while (*n_states && --end >= data && byte_count[(c = *end)]);
+
+        return NULL;
+    }
+};
 
 ////////////////////////////////////////////////////////////////////////////////
 // Match handlers

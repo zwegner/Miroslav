@@ -92,12 +92,16 @@ int main(int argc, char **argv) {
 
     bool print_path = (argc > 1);
     MatchHandlerPrintLine mh(print_path, !print_count, print_count);
+
     if (state <= 32)
         run<BasicMatchVerifier32>(argc, argv, edges, mh);
     else if (state <= 64)
         run<BasicMatchVerifier64>(argc, argv, edges, mh);
     else if (state <= 128)
         run<BasicMatchVerifier128>(argc, argv, edges, mh);
+    // SIMD verifier: only allow 254 states since we need an extra for a sentinel
+    else if (state <= 255)
+        run<SIMDMatchVerifier<VEC_INFO>>(argc, argv, edges, mh);
     else {
         std::cerr << "error: max states exceeded: " << state << "\n";
         exit(1);
