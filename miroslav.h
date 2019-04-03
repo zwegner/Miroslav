@@ -166,6 +166,16 @@ inline VecInfoAVX2::vmask test_eq<VecInfoAVX2, uint16_t>(
 // each potential match backwards from the end character.
 ////////////////////////////////////////////////////////////////////////////////
 
+// Always return true. Bad for correctness, good for testing speed of the core
+// Miroslav algorithm.
+struct FakeMatchVerifier {
+    FakeMatchVerifier(UNUSED NFAEdgeList &edges) { }
+
+    const uint8_t *verify(UNUSED const uint8_t *data, UNUSED const uint8_t *end) {
+        return end;
+    }
+};
+
 // Basic bitset NFA simulator
 template<typename StateInfo>
 class BasicMatchVerifier {
