@@ -24,6 +24,8 @@ static inline uint32_t bsf32(uint32_t x) {
 #define START_STATE (0)
 #define END_STATE (1)
 
+typedef std::vector<std::tuple<uint8_t, uint32_t, uint32_t>> NFAEdgeList;
+
 // Wacky macro to make tuple unpacking a little less annoying
 #define FOR_EACH_EDGE(c, from, to, edges) \
     for (auto edge_i = edges.begin(); \
@@ -82,10 +84,6 @@ struct VecInfoAVX2 {
     // five that we'd prefer
     static const uint32_t LMASK = 16 - 1;
 
-    static inline V broadcast(uint8_t value) {
-        return _mm256_set1_epi8(value);
-    }
-
     static inline V permute(V &table, V &index) {
         return _mm256_shuffle_epi8(table, index);
     }
@@ -123,10 +121,6 @@ struct VecInfoAVX2 {
         return ~_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, _mm256_setzero_si256()));
     }
 
-    static inline vmask test_eq(V &a, V &b) {
-        return _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b));
-    }
-
     static void prepare_state_table(uint8_t state_bytes[VL]) {
         // HACK because AVX2 sucks and can only do 16-byte shuffles
         for (uint32_t i = 0; i < 16; i++)
@@ -134,7 +128,37 @@ struct VecInfoAVX2 {
     }
 };
 
-typedef std::vector<std::tuple<uint8_t, uint32_t, uint32_t>> NFAEdgeList;
+// Functions specialized on both vector size and element size. C++ doesn't
+// allow explicit specializations inside classes, so they're out here...
+
+// Broadcast
+template<typename VI, typename element>
+inline typename VI::V broadcast(element value);
+template<>
+inline VecInfoAVX2::V broadcast<VecInfoAVX2, uint8_t>(uint8_t value) {
+    return _mm256_set1_epi8(value);
+}
+template<>
+inline VecInfoAVX2::V broadcast<VecInfoAVX2, uint16_t>(uint16_t value) {
+    return _mm256_set1_epi16(value);
+}
+
+// Test equal
+template<typename VI, typename element>
+inline typename VI::vmask test_eq(typename VI::V &a, typename VI::V &b);
+template<>
+inline VecInfoAVX2::vmask test_eq<VecInfoAVX2, uint8_t>(
+        VecInfoAVX2::V &a, VecInfoAVX2::V &b) {
+    return _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b));
+}
+template<>
+inline VecInfoAVX2::vmask test_eq<VecInfoAVX2, uint16_t>(
+        VecInfoAVX2::V &a, VecInfoAVX2::V &b) {
+    // HACK: avx2 doesn't have a movemask_epi16 instruction. So we just use the
+    // epi8 version, and in the one place test_eq is used now, we divide the
+    // bitscan of this mask by 2.
+    return _mm256_movemask_epi8(_mm256_cmpeq_epi16(a, b));
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 // Match verifier
@@ -234,31 +258,34 @@ typedef BasicMatchVerifier<StateInfo32> BasicMatchVerifier32;
 typedef BasicMatchVerifier<StateInfo64> BasicMatchVerifier64;
 typedef BasicMatchVerifier<StateInfo128> BasicMatchVerifier128;
 
-template<class VI>
-class SIMDMatchVerifier {
+template<class VI, typename VE>
+class _SIMDMatchVerifier {
     // Hacky substitute for "using"
     typedef typename VI::V V;
     typedef typename VI::vmask vmask;
     static const uint32_t VL = VI::VL;
 
-    uint8_t byte_count[256];
-    uint8_t *edge_keys[256];
-    uint8_t *edge_values[256];
+    static const uint32_t N_VE = VI::VL / sizeof(VE);
+    static const uint32_t MAX_STATES = (1 << 8 * sizeof(VE));
+    static const uint32_t SENTINEL = MAX_STATES - 1;
+
+    uint32_t key_count[256];
+    VE *edge_keys[256];
+    VE *edge_values[256];
 
 public:
-    SIMDMatchVerifier(NFAEdgeList &edges) {
+    _SIMDMatchVerifier(NFAEdgeList &edges) {
         // Group NFA edges into vectors by character
         struct kv_pair {
-            uint8_t k, v;
-            kv_pair(uint8_t k, uint8_t v) : k(k), v(v) { }
+            VE k, v;
+            kv_pair(VE k, VE v) : k(k), v(v) { }
         };
         std::vector<struct kv_pair> edge_pairs[256];
         uint8_t c;
         uint32_t from, to;
         FOR_EACH_EDGE(c, from, to, edges) {
-            // We use 255 as a sentinel value, so can only use 254 real states
-            assert(from < 255);
-            assert(to < 255);
+            assert(from < SENTINEL);
+            assert(to < SENTINEL);
             edge_pairs[c].push_back(kv_pair(to, from));
         }
 
@@ -270,38 +297,39 @@ public:
 
             if (edge_pairs[i].size() == 0) {
                 edge_keys[i] = edge_values[i] = NULL;
-                byte_count[i] = 0;
+                key_count[i] = 0;
                 continue;
             }
 
-            // Add VL bytes and clear the low bits (x & -VL rounds x down to the
-            // nearest multiple of VL) to get the number of bytes we will store
-            // the keys/values in. We add VL to round up, but also multiples of VL
-            // round up to the next multiple, so we always get at least one
-            // extra slot. That way we can just compare states in a loop while
-            // ignoring the array length (since we're storing 255s at the end of
-            // the table that will always compare false).
-            byte_count[i] = (edge_pairs[i].size() + VL) & -VL;
-            edge_keys[i] = (uint8_t *)malloc(byte_count[i]);
-            edge_values[i] = (uint8_t *)malloc(byte_count[i]);
+            // Calculate number of elements. We add N_VE and clear the low bits
+            // (x & -N_VE rounds x down to the nearest multiple of N_VE) to get
+            // the number of bytes we will store the keys/values in. We add
+            // N_VE to round up, but also multiples of N_VE round up to the
+            // next multiple, so we always get at least one extra slot. That
+            // way we can just compare states in a loop while ignoring the
+            // array length (since we're storing 255s at the end of the table
+            // that will always compare false).
+            key_count[i] = (edge_pairs[i].size() + N_VE) & -N_VE;
+            edge_keys[i] = (VE *)malloc(key_count[i] * sizeof(VE));
+            edge_values[i] = (VE *)malloc(key_count[i] * sizeof(VE));
 
             // Copy the sorted vector into the key/value lists, filling in the
-            // rest of the values with 255
+            // rest of the values with SENTINEL
             uint32_t j;
             for (j = 0; j < edge_pairs[i].size(); j++) {
                 edge_keys[i][j] = edge_pairs[i][j].k;
                 edge_values[i][j] = edge_pairs[i][j].v;
             }
-            for (; j < byte_count[i]; j++) {
-                edge_keys[i][j] = 255;
-                edge_values[i][j] = 255;
+            for (; j < key_count[i]; j++) {
+                edge_keys[i][j] = SENTINEL;
+                edge_values[i][j] = SENTINEL;
             }
         }
     }
 
-    ~SIMDMatchVerifier() {
+    ~_SIMDMatchVerifier() {
         for (uint32_t i = 0; i < 256; i++) {
-            if (byte_count[i]) {
+            if (key_count[i]) {
                 free(edge_keys[i]);
                 free(edge_values[i]);
             }
@@ -312,9 +340,9 @@ public:
         // We have two state lists and switch between them like double buffering.
         // We keep a pointer to the current and next states, which we swap each
         // iteration.
-        uint8_t _states[2][256];
+        VE _states[2][MAX_STATES];
         uint32_t _n_states[2];
-        uint8_t *states = _states[0], *next_states = _states[1];
+        VE *states = _states[0], *next_states = _states[1];
         uint32_t *n_states = &_n_states[0], *next_n_states = &_n_states[1];
 
         *n_states = 1;
@@ -324,20 +352,23 @@ public:
             *next_n_states = 0;
             uint64_t seen = 0;
             for (uint32_t s = 0; s < *n_states; s++) {
-                uint8_t state = states[s];
-                V state_vec = VI::broadcast(state);
-                for (uint32_t i = 0; i < byte_count[c]; i += VL) {
+                VE state = states[s];
+                V state_vec = broadcast<VI, VE>(state);
+                for (uint32_t i = 0; i < key_count[c]; i += N_VE) {
                     // Load VL contiguous key bytes into one vector, and
                     // compare the current state against all of them at once
                     auto key = *(V *)&edge_keys[c][i];
-                    vmask eq = VI::test_eq(key, state_vec);
+                    vmask eq = test_eq<VI, VE>(key, state_vec);
 
                     // If there was a match, there might be multiple
                     // predecessor states from this state/input byte. Since
                     // we sort the keys, we can just get the index of the
                     // first match with bsf, and loop while the keys match.
                     if (EXPECT(eq, 0)) {
-                        for (uint32_t x = bsf64(eq) + i; edge_keys[c][x] == state; x++) {
+                        // HACK: we divide by sizeof(VE) since there's no movemask_epi16
+                        uint32_t start = bsf64(eq)/sizeof(VE) + i;
+
+                        for (uint32_t x = start; edge_keys[c][x] == state; x++) {
                             auto ns = edge_values[c][x];
 
                             // Check for reaching the start state, and return immediately
@@ -373,11 +404,14 @@ skip:
         // NFA states, advance the pointer backwards, make sure it's still in
         // bounds, read the next byte, and make sure there are predecessor states
         // for that input byte
-        while (*n_states && --end >= data && byte_count[(c = *end)]);
+        while (*n_states && --end >= data && key_count[(c = *end)]);
 
         return NULL;
     }
 };
+
+typedef _SIMDMatchVerifier<VEC_INFO, uint8_t> SIMDMatchVerifier8;
+typedef _SIMDMatchVerifier<VEC_INFO, uint16_t> SIMDMatchVerifier16;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Match handlers
@@ -558,7 +592,7 @@ public:
             }
         }
 
-        v_char_mask = VI::broadcast(LMASK);
+        v_char_mask = broadcast<VI, uint8_t>(LMASK);
     }
 
     typename MatchHandler::return_type run(File &f) {
@@ -571,7 +605,7 @@ public:
         // last byte of each of these vectors is ever used.
         V last_to[N_BYTES];
         for (uint32_t b = 0; b < N_BYTES; b++)
-            last_to[b] = VI::broadcast(state_mask(START_STATE, b));
+            last_to[b] = broadcast<VI, uint8_t>(state_mask(START_STATE, b));
 
         const uint8_t *chunk;
         for (chunk = f.data; chunk + VL <= f.data + f.size; chunk += VL) {
