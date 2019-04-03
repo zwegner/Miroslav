@@ -1,5 +1,6 @@
 #pragma once
 
+#include <assert.h>
 #include <stdint.h>
 
 #include <iostream>
@@ -14,15 +15,12 @@ static inline uint32_t bsf64(uint64_t x) {
 	return __builtin_ctzll(x);
 }
 
+static inline uint32_t bsf32(uint32_t x) {
+	return __builtin_ctzl(x);
+}
+
 #define START_STATE (0)
 #define END_STATE (1)
-
-// For the backwards verification run. smask should have MAX_STATES bits.
-// The backwards state table will be (max/8) * max * 256 bytes.
-// So 8 states is 2K, 16 => 8K, 32 => 32K, 64 => 128K, 128 => 512K
-
-#define MAX_STATES (32)
-typedef uint32_t smask;
 
 // Wacky macro to make tuple unpacking a little less annoying
 #define FOR_EACH_EDGE(c, from, to, edges) \
@@ -137,54 +135,97 @@ typedef std::vector<std::tuple<uint8_t, uint32_t, uint32_t>> NFAEdgeList;
 // each potential match backwards from the end character.
 ////////////////////////////////////////////////////////////////////////////////
 
-template<bool linewise_matches>
+// Basic bitset NFA simulator
+template<typename StateInfo>
 class BasicMatchVerifier {
-    // This is a table of [state][input_character] -> prev_states, where
-    smask back_edges[MAX_STATES][256];
+    typedef typename StateInfo::smask smask;
+    static const uint32_t MAX_STATES = StateInfo::MAX_STATES;
+
+    // This is a table of [input_byte][state] -> prev_states
+    smask back_edges[256][MAX_STATES];
+    // All states that lead to a successful match from each input byte
+    smask match_mask[256];
+    // Shortcut mask: for each input byte, keep a mask of states that have a
+    // predecessor state so we don't try any unnecessary lookups
+    smask next_mask[256];
 
 public:
-    BasicMatchVerifier(std::vector<std::tuple<uint8_t, uint32_t, uint32_t>> &edges) {
-        for (uint32_t i = 0; i < MAX_STATES; i++)
-            for (uint32_t j = 0; j < 256; j++)
+    BasicMatchVerifier(NFAEdgeList &edges) {
+        for (uint32_t i = 0; i < 256; i++) {
+            for (uint32_t j = 0; j < MAX_STATES; j++)
                 back_edges[i][j] = 0;
+            next_mask[i] = 0;
+            match_mask[i] = 0;
+        }
 
-        // Initialize from/to state masks tables
-        for (auto edge : edges) {
-            uint8_t c;
-            uint32_t from, to;
-            std::tie(c, from, to) = edge;
+        // Initialize state mask tables
+        uint8_t c;
+        uint32_t from, to;
+        FOR_EACH_EDGE(c, from, to, edges) {
+            assert(from < MAX_STATES);
+            assert(to < MAX_STATES);
+            next_mask[c] |= (smask)1 << to;
 
-            // Fill in backwards edges in the NFA graph
-            back_edges[to][c] |= 1 << from;
+            if (from == START_STATE)
+                match_mask[c] |= (smask)1 << to;
+            else
+                back_edges[c][to] |= (smask)1 << from;
         }
     }
 
     const uint8_t *verify(const uint8_t *data, const uint8_t *end) {
         smask states = 1 << END_STATE;
 
-        while (states && end >= data) {
+        do {
             uint8_t c = *end;
 
-            if (linewise_matches && c == '\n')
-                break;
-
-            // Iterate through all current states
-            smask next_states = 0;
-            while (states) {
-                uint32_t s = bsf64(states);
-                next_states |= back_edges[s][c];
-                states &= states - 1;
-            }
-
-            if (next_states & (1 << START_STATE))
+            if (match_mask[c] & states)
                 return end;
 
+            states &= next_mask[c];
+
+            // Iterate through all current states and look up their next states
+            smask next_states = 0;
+            while (states) {
+                uint32_t s = StateInfo::bsf(states);
+                next_states |= back_edges[c][s];
+                states &= states - 1;
+            }
             states = next_states;
-            end--;
-        }
+        } while (states && --end >= data);
+
         return NULL;
     }
 };
+
+// Structs with definitions for the BasicMatchVerifier.
+// smask should have MAX_STATES bits.
+// The backwards state table will be (max/8) * max * 256 bytes.
+// So 8 states is 2K, 16 => 8K, 32 => 32K, 64 => 128K, 128 => 512K
+
+struct StateInfo32 {
+    static const uint32_t MAX_STATES = 32;
+    typedef uint32_t smask;
+    static inline uint32_t bsf(smask x) { return bsf32(x); }
+};
+struct StateInfo64 {
+    static const uint32_t MAX_STATES = 64;
+    typedef uint64_t smask;
+    static inline uint32_t bsf(smask x) { return bsf64(x); }
+};
+struct StateInfo128 {
+    static const uint32_t MAX_STATES = 128;
+    typedef __uint128_t smask;
+    static inline uint32_t bsf(smask x) {
+        if ((uint64_t)x)
+            return bsf64(((uint64_t)x));
+        return bsf64(x >> 64) + 64;
+    }
+};
+
+typedef BasicMatchVerifier<StateInfo32> BasicMatchVerifier32;
+typedef BasicMatchVerifier<StateInfo64> BasicMatchVerifier64;
+typedef BasicMatchVerifier<StateInfo128> BasicMatchVerifier128;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Match handlers

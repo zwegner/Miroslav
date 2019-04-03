@@ -10,6 +10,18 @@
 // hacky macro for easier argument chomping
 #define EAT_ARG() do { argc--; argv++; } while (0);
 
+template <typename MatchVerifier>
+void run(int argc, char **argv, NFAEdgeList &edges, MatchHandlerPrintLine &mh) {
+    Miroslav<MatchHandlerPrintLine, MatchVerifier> m(edges, mh); 
+
+    while (argc > 0) {
+        File f(argv[0]);
+        EAT_ARG();
+
+        m.run(f);
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0] << " [-c] pattern path...\n";
@@ -78,20 +90,16 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (state > MAX_STATES) {
+    bool print_path = (argc > 1);
+    MatchHandlerPrintLine mh(print_path, !print_count, print_count);
+    if (state <= 32)
+        run<BasicMatchVerifier32>(argc, argv, edges, mh);
+    else if (state <= 64)
+        run<BasicMatchVerifier64>(argc, argv, edges, mh);
+    else if (state <= 128)
+        run<BasicMatchVerifier128>(argc, argv, edges, mh);
+    else {
         std::cerr << "error: max states exceeded: " << state << "\n";
         exit(1);
-    }
-
-    bool print_path = (argc > 1);
-
-    MatchHandlerPrintLine mh(print_path, !print_count, print_count);
-    Miroslav<MatchHandlerPrintLine> m(edges, mh); 
-
-    while (argc > 0) {
-        File f(argv[0]);
-        EAT_ARG();
-
-        m.run(f);
     }
 }
