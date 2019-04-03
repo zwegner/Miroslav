@@ -129,6 +129,8 @@ struct VecInfoAVX2 {
     }
 };
 
+typedef std::vector<std::tuple<uint8_t, uint32_t, uint32_t>> NFAEdgeList;
+
 ////////////////////////////////////////////////////////////////////////////////
 // Match verifier
 // Since the vectorized matcher can give false positives, we have to run through
@@ -272,7 +274,8 @@ public:
 ////////////////////////////////////////////////////////////////////////////////
 // Miroslav: the core SIMD string matching algorithm
 ////////////////////////////////////////////////////////////////////////////////
-template<typename VI, typename MatchVerifier, typename MatchHandler, const uint32_t SHIFTS[]>
+template<typename VI, typename MatchVerifier, typename MatchHandler,
+    const uint32_t N_BYTES, const uint32_t N_SHIFTS, const uint32_t SHIFTS[]>
 class _Miroslav {
     // Hacky substitute for "using"
     typedef typename VI::V V;
@@ -281,25 +284,44 @@ class _Miroslav {
     static const uint32_t VL = VI::VL;
     static const uint32_t LMASK = VI::LMASK;
 
-    static inline uint8_t state_mask(uint32_t state) {
-        if (state == START_STATE)
-            return 1 << 0;
-        if (state == END_STATE)
-            return 1 << 7;
-        return 1 << (state % 6 + 1);
+    static inline uint8_t state_mask(uint32_t state, uint32_t byte) {
+        // If we only have one byte of state bits, start and end states
+        // get the bottom and top bits, and all the other states rotate
+        // through the other 6 bits
+        if (N_BYTES == 1) {
+            if (state == START_STATE)
+                return 1 << 0;
+            if (state == END_STATE)
+                return 1 << 7;
+            return 1 << (state % 6 + 1);
+        }
+        // For two or more state bytes, we use the top bit of the first
+        // two bytes for the start and end states (for vpmovmskb convenience)
+        // and all the other states rotate through the remaining bits
+        else {
+            if (state == START_STATE)
+                return byte == 0 ? 1 << 7 : 0;
+            if (state == END_STATE)
+                return byte == 1 ? 1 << 7 : 0;
+            state = state % (N_BYTES * 8 - 2);
+            // Skip over bit 7 (start) and 15 (end)
+            state += (state >= 7);
+            state += (state >= 15);
+            // Return the proper bit within this byte if the high bits of the
+            // state id match the byte number
+            return ((state >> 3) == byte) << (state & 7);
+        }
     }
 
     static inline uint8_t char_mask(uint8_t c, uint32_t shift) {
         return (c >> shift) & LMASK;
     }
 
-    static const uint32_t N_SHIFTS = sizeof(SHIFTS) / sizeof(uint32_t);
-
     MatchVerifier match_verifier;
     MatchHandler &match_handler;
 
-    V from_states[N_SHIFTS];
-    V to_states[N_SHIFTS];
+    V from_states[N_BYTES][N_SHIFTS];
+    V to_states[N_BYTES][N_SHIFTS];
     V v_char_mask;
 
     // For branchless testing of whether a pattern has a 1-character match.
@@ -309,10 +331,10 @@ class _Miroslav {
     vmask has_1_char_match;
 
 public:
-    _Miroslav(std::vector<std::tuple<uint8_t, uint32_t, uint32_t>> &edges,
-            MatchHandler &handler) : match_verifier(edges), match_handler(handler) {
-        uint8_t from_state_bytes[N_SHIFTS][VL] = {{0}};
-        uint8_t to_state_bytes[N_SHIFTS][VL] = {{0}};
+    _Miroslav(NFAEdgeList &edges, MatchHandler &handler) :
+            match_verifier(edges), match_handler(handler) {
+        uint8_t from_state_bytes[N_BYTES][N_SHIFTS][VL] = {{{0}}};
+        uint8_t to_state_bytes[N_BYTES][N_SHIFTS][VL] = {{{0}}};
 
         has_1_char_match = 0;
 
@@ -320,9 +342,13 @@ public:
         uint8_t c;
         uint32_t from, to;
         FOR_EACH_EDGE(c, from, to, edges) {
-            for (uint32_t s = 0; s < N_SHIFTS; s++) {
-                from_state_bytes[s][char_mask(c, SHIFTS[s])] |= state_mask(from);
-                to_state_bytes[s][char_mask(c, SHIFTS[s])] |= state_mask(to);
+            for (uint32_t b = 0; b < N_BYTES; b++) {
+                uint8_t fm = state_mask(from, b);
+                uint8_t tm = state_mask(to, b);
+                for (uint32_t s = 0; s < N_SHIFTS; s++) {
+                    from_state_bytes[b][s][char_mask(c, SHIFTS[s])] |= fm;
+                    to_state_bytes[b][s][char_mask(c, SHIFTS[s])] |= tm;
+                }
             }
 
             // Check for 1-character matches and update the mask
@@ -330,11 +356,13 @@ public:
                 has_1_char_match = (vmask)-1;
         }
 
-        for (uint32_t s = 0; s < N_SHIFTS; s++) {
-            VI::prepare_state_table(from_state_bytes[s]);
-            VI::prepare_state_table(to_state_bytes[s]);
-            from_states[s] = *(V*)from_state_bytes[s];
-            to_states[s] = *(V*)to_state_bytes[s];
+        for (uint32_t b = 0; b < N_BYTES; b++) {
+            for (uint32_t s = 0; s < N_SHIFTS; s++) {
+                VI::prepare_state_table(from_state_bytes[b][s]);
+                VI::prepare_state_table(to_state_bytes[b][s]);
+                from_states[b][s] = *(V*)from_state_bytes[b][s];
+                to_states[b][s] = *(V*)to_state_bytes[b][s];
+            }
         }
 
         v_char_mask = VI::broadcast(LMASK);
@@ -343,53 +371,94 @@ public:
     typename MatchHandler::return_type run(File &f) {
         match_handler.start();
 
-        double_vmask carry;
-        vmask last_carry = 0;
-        V last_to = VI::broadcast(state_mask(START_STATE));
+        double_vmask carry, last_carry = 0;
+
+        // Fill a vector for each byte of state mask with the starting state. This
+        // vector tracks the state between iterations of the main loop. Only the
+        // last byte of each of these vectors is ever used.
+        V last_to[N_BYTES];
+        for (uint32_t b = 0; b < N_BYTES; b++)
+            last_to[b] = VI::broadcast(state_mask(START_STATE, b));
 
         const uint8_t *chunk;
         for (chunk = f.data; chunk + VL <= f.data + f.size; chunk += VL) {
             V input = *(V*)chunk;
 
-            V from;
-            V to;
-            for (uint32_t s = 0; s < N_SHIFTS; s++) {
-                V masked_input = input;
-                if (SHIFTS[s])
-                    masked_input = VI::vec_shr(masked_input, SHIFTS[s]);
-                masked_input = VI::vec_and(masked_input, v_char_mask);
+            vmask start_m, end_m, seq_m = 0;
 
-                V f = VI::permute(from_states[s], masked_input);
-                V t = VI::permute(to_states[s], masked_input);
-                if (s == 0) {
-                    from = f;
-                    to = t;
-                } else {
-                    from = VI::vec_and(from, f);
-                    to = VI::vec_and(to, t);
+            for (uint32_t b = 0; b < N_BYTES; b++) {
+                V from, to;
+                // For each of the shifts defined in the template arguments, do
+                // a vector table lookup by shifting each byte by the shift, masking,
+                // and doing a permute on the appropriate table vector. We AND the
+                // results together for each of these shifts, which should narrow down
+                // the number of false positives from different input bytes
+                // mapping to the same character class.
+                for (uint32_t s = 0; s < N_SHIFTS; s++) {
+                    V masked_input = input;
+                    if (SHIFTS[s])
+                        masked_input = VI::vec_shr(masked_input, SHIFTS[s]);
+                    masked_input = VI::vec_and(masked_input, v_char_mask);
+
+                    V f = VI::permute(from_states[b][s], masked_input);
+                    V t = VI::permute(to_states[b][s], masked_input);
+                    if (s == 0) {
+                        from = f;
+                        to = t;
+                    } else {
+                        from = VI::vec_and(from, f);
+                        to = VI::vec_and(to, t);
+                    }
                 }
+
+                // Get a vector of the to states, but shifted back in the data
+                // stream by 1 byte. We fill the empty space in the first lane with
+                // the last lane from last_to (which is initialized to the starting
+                // state).
+                V shl_to_1 = VI::vec_lanes_shl_1(to, last_to[b]);
+                last_to[b] = to;
+
+                // Test which input bytes can lead from the start state, and lead to
+                // the end state. We handle the N_BYTES=1 and N cases differently,
+                // because for 1, both bits are in the same byte, but otherwise, it's
+                // a bit cheaper to have the start and end state bits in the top bit
+                // of the first two state bytes, since vpmovmskb only looks at the
+                // high bits of each byte in a vector. All this code should be 
+                // unrolled/branchless, with start_m and end_m being set exactly once.
+                if (N_BYTES == 1) {
+                    start_m = VI::test_low_bit(from);
+                    end_m = VI::test_high_bit(to);
+                } else {
+                    if (b == 0)
+                        start_m = VI::test_high_bit(from);
+                    else if (b == 1)
+                        end_m = VI::test_high_bit(to);
+                }
+
+                // Now find all input bytes that can come from some state that the
+                // previous input byte could lead to.
+                V seq = VI::vec_and(shl_to_1, from);
+                seq_m |= VI::test_nz(seq);
             }
 
-            // Get a vector of the to states, but shifted back in the data
-            // stream by 1 byte. We fill the empty space in the first lane with
-            // the last lane from last_to (which is initialized to the starting
-            // state).
-            V shl_to_1 = VI::vec_lanes_shl_1(to, last_to);
-
-            V trans = VI::vec_and(shl_to_1, from);
-
-            // Find which input bytes lead to the start and end states.
-            vmask start_m = VI::test_low_bit(from);
-            vmask end_m = VI::test_high_bit(to);
-            vmask trans_m = VI::test_nz(trans);
-
-            vmask covered = end_m & trans_m;
-            carry = last_carry + ((double_vmask)start_m << 1) + trans_m;
+            // Test for potential matches. We use the ripple of carries through the
+            // "seq" mask to find sequences of input bytes that lead from the start
+            // state to the end state, while passing through valid state transitions.
+            // To be precise, since carries will ripple past the end mask, we find
+            // bits in the end mask that are cleared by a carry. This is slightly
+            // complicated by a couple factors: first, we have to keep track of
+            // carries across iterations (which is why we use the "double_vmask"
+            // type and shift carry right by VL each iteration), and second, extra
+            // bits in the start mask can make us think a carry didn't happen, so
+            // we clear out bits from start_m before testing the carries with
+            // the end mask.
+            carry = last_carry + ((double_vmask)start_m << 1) + seq_m;
+            vmask covered = end_m & seq_m;
             vmask matches = ~(carry & ~start_m) & covered;
-            // Check for 1-char matches
+
+            // Check for 1-char matches, if they're possible
             matches |= has_1_char_match & start_m & end_m;
 
-            last_to = to;
             last_carry = carry >> VL;
 
             // Look through the bitset of all potential matches, and run a
@@ -420,5 +489,6 @@ public:
 
 // Template alias using VEC_INFO class defined in the Makefile
 static constexpr uint32_t SHIFTS[] = {0, 3};
-template <typename MatchHandler>
-using Miroslav = _Miroslav<VEC_INFO, BasicMatchVerifier<true>, MatchHandler, SHIFTS>;
+static constexpr uint32_t N_SHIFTS = sizeof(SHIFTS) / sizeof(SHIFTS[0]);
+template <typename MatchHandler, typename MatchVerifier>
+using Miroslav = _Miroslav<VEC_INFO, MatchVerifier, MatchHandler, 1, N_SHIFTS, SHIFTS>;

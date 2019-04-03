@@ -41,7 +41,7 @@ int main(int argc, char **argv) {
         EAT_ARG();
     }
 
-    std::vector<std::tuple<uint8_t, uint32_t, uint32_t>> edges;
+    NFAEdgeList edges;
     uint32_t last_state = START_STATE;
     uint32_t state = 2;
     bool can_be_duplicate = true;
