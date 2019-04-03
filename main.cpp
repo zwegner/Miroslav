@@ -1,8 +1,9 @@
 #include <stdlib.h>
 #include <sys/mman.h>
 
-#include <iostream>
 #include <fstream>
+#include <iostream>
+#include <map>
 #include <sstream>
 
 #include "miroslav.h"
@@ -54,6 +55,10 @@ int main(int argc, char **argv) {
     }
 
     NFAEdgeList edges;
+
+    typedef std::pair<uint8_t, uint32_t> edge_key;
+    std::map<edge_key, uint32_t> edge_map{};
+
     uint32_t last_state = START_STATE;
     uint32_t state = 2;
     bool can_be_duplicate = true;
@@ -68,21 +73,16 @@ int main(int argc, char **argv) {
             // branch off a previous state that matches the substring
             // up until now.
             if (can_be_duplicate) {
-                uint8_t c2;
-                uint32_t f2, t2;
-                can_be_duplicate = false;
-                FOR_EACH_EDGE(c2, f2, t2, edges) {
-                    if (c2 == c && f2 == last_state && t2 != END_STATE) {
-                        can_be_duplicate = true;
-                        last_state = t2;
-                        break;
-                    }
-                }
-                if (can_be_duplicate)
+                edge_key k(c, last_state);
+                if (edge_map.count(k)) {
+                    last_state = edge_map[k];
                     continue;
+                } else
+                    can_be_duplicate = false;
             }
             if (i < pattern.length() - 1 && pattern[i + 1] != sep) {
                 edges.push_back(std::make_tuple(c, last_state, state));
+                edge_map[edge_key(c, last_state)] = state;
                 last_state = state;
                 state += 1;
             } else
