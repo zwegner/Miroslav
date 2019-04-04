@@ -348,11 +348,17 @@ class _SIMDMatcher {
     // instruction. This should be all ones (thus a no-op) unless sizeof(VE) > 2.
     static const vmask VCMP_BITS = ~(-1 << N_VE * MOVEMASK_HACK);
 
+    // Associative array of state -> state transitions, with a different array per
+    // possible input byte
     uint32_t key_count[256];
     VE *edge_keys[256];
     VE *edge_values[256];
 
+    // For keeping track of all current states and all next states
     VE *_state_buffer[2];
+
+    // For keeping track of where a given NFA match sequence started
+    uint32_t *_start_buffer[2];
 
     // Stuff to act like a full regex matcher
     MatchHandler &match_handler;
@@ -438,10 +444,19 @@ public:
         }
 
         // Allocate two buffers for storing the current states
-        // +64 because we can write past the end of this array
-        size_t buf_size = max_concurrent_states * sizeof(VE) + 64;
+        // +VL because we can write past the end of this array
+        size_t buf_size = max_concurrent_states * sizeof(VE) + VL;
         _state_buffer[0] = (VE *)malloc(buf_size);
         _state_buffer[1] = (VE *)malloc(buf_size);
+
+        // Allocate buffers for storing the start index of each
+        // match as well. We have to allocate a bit more scratch
+        // space at the end, since with this array we could potentially
+        // write up to 4*VL bytes off the end
+        size_t start_buf_size = max_concurrent_states * sizeof(uint32_t);
+        start_buf_size += (VL * sizeof(uint32_t) / sizeof(VE));
+        _start_buffer[0] = (uint32_t *)malloc(start_buf_size);
+        _start_buffer[1] = (uint32_t *)malloc(start_buf_size);
     }
 
     ~_SIMDMatcher() {
@@ -451,8 +466,10 @@ public:
                 free(edge_values[i]);
             }
         }
-        free(_state_buffer[0]);
-        free(_state_buffer[1]);
+        for (uint32_t i = 0; i < 2; i++) {
+            free(_state_buffer[i]);
+            free(_start_buffer[i]);
+        }
     }
 
     const uint8_t *verify(const uint8_t *data, const uint8_t *end) {
@@ -463,6 +480,10 @@ public:
         uint32_t _n_states[2];
         uint32_t *n_states = &_n_states[0], *next_n_states = &_n_states[1];
 
+        // Also keep an index for each state in the list, pointing to where
+        // in the input stream the match started
+        uint32_t *start_idx = _start_buffer[0], *next_start_idx = _start_buffer[1];
+
         // For continuous operation, we will have the INITIAL_STATE always in
         // the current state set. To do this easily, we just always keep it
         // in the first position, and only write to entries after the first.
@@ -471,17 +492,21 @@ public:
             next_states[0] = INITIAL_STATE;
         }
 
+        const uint8_t *input_p = FORWARDS ? data : end;
+
         *n_states = 1;
         states[0] = INITIAL_STATE;
-        const uint8_t *input_p = FORWARDS ? data : end;
+        start_idx[0] = input_p - data + (FORWARDS ? -1 : 1);
+
         do {
             uint8_t c = *input_p;
 
             // CONTINUOUS mode has an implied initial state always at the 
             // beginning of the buffer
-            if (CONTINUOUS)
+            if (CONTINUOUS) {
                 *next_n_states = 1;
-            else
+                next_start_idx[0] = input_p - data;
+            } else
                 *next_n_states = 0;
 
             // Add a (lossy) bitset of already examined states this iteration,
@@ -494,34 +519,66 @@ public:
             for (uint32_t s = 0; s < *n_states; s++) {
                 VE state = states[s];
                 V state_vec = broadcast<VI, VE>(state);
+                V start_idx_vec = broadcast<VI, uint32_t>(start_idx[s]);
 
                 // Check for whether we've already added this state
                 if (seen.might_contain(state)) {
+                    // We found a match! We added the target state to the
+                    // seen bitset so we can only do this test in the
+                    // slow path.
                     if (state == TARGET_STATE) {
+                        // Continuous case: pass the match off to the match
+                        // handler and continue
                         if (CONTINUOUS) {
-                            // XXX No start position yet
-                            match_handler.handle_match(*input_file, input_p-1, input_p);
+                            // Register the match. We have to do a bit of
+                            // index math to make the start/end points line
+                            // up correctly in both the forwards and backwards
+                            // cases. Why would we be streaming backwards? Who
+                            // the hell knows?
+                            if (FORWARDS)
+                                match_handler.handle_match(*input_file,
+                                        data + start_idx[s] + 1, input_p - 1);
+                            else
+                                match_handler.handle_match(*input_file,
+                                        input_p + 1, data + start_idx[s] - 1);
 
                             // Skip to the next newline, clear out all intermediate states
-                            while (input_p < end && *input_p != '\n')
-                                input_p++;
+                            // XXX this should be templated or something
+                            if (FORWARDS)
+                                while (input_p < end && *input_p != '\n')
+                                    input_p++;
+                            else
+                                while (input_p >= data && *input_p != '\n')
+                                    input_p--;
 
                             *next_n_states = 1;
+                            next_start_idx[0] = input_p - data;
 
                             break;
-                        } else
+                        }
+                        // Non-continuous case: we were just verifying that there was
+                        // a match. Oh hey, looks like there was one.
+                        else
                             return input_p;
                     }
 
+                    // We potentially have a duplicate state. Since the state could
+                    // be anywhere in the state array before this state, we do a bulk
+                    // compare using vector instructions against the whole array. In
+                    // the loop we only compare up to the last part of the array that
+                    // fits entirely within a vector. The rest are compared with a
+                    // special case after.
                     uint32_t s_rounded = s & -N_VE;
-                    for (uint32_t i = 0; i < s_rounded; i += N_VE)
-                    {
-                        auto key = *(V *)&states[i];
+                    for (uint32_t i = 0; i < s_rounded; i += N_VE) {
+                        V key = *(V *)&states[i];
                         vmask eq = test_eq<VI, VE>(key, state_vec);
                         if (eq)
                             goto skip;
                     }
-                    auto key = *(V *)&states[s_rounded];
+                    // Compare the last set of states before this one. We
+                    // compare all of them, but only test the bits below
+                    // the one corresponding to this state.
+                    V key = *(V *)&states[s_rounded];
                     vmask eq = test_eq<VI, VE>(key, state_vec);
                     if (eq & (1 << (s - s_rounded)) - 1)
                         goto skip;
@@ -531,7 +588,7 @@ public:
                 for (uint32_t i = 0; i < key_count[c]; i += N_VE) {
                     // Load VL contiguous key bytes into one vector, and
                     // compare the current state against all of them at once
-                    auto key = *(V *)&edge_keys[c][i];
+                    V key = *(V *)&edge_keys[c][i];
                     vmask eq = test_eq<VI, VE>(key, state_vec);
 
                     // If there was a match, there might be multiple
@@ -562,20 +619,30 @@ public:
                         // length here
                         uint32_t j = i;
                         for (; !gt; j += N_VE) {
-                            auto key = *(V *)&edge_keys[c][j + N_VE];
+                            V key = *(V *)&edge_keys[c][j + N_VE];
                             gt = ~test_eq<VI, VE>(key, state_vec);
                         }
 
                         uint32_t end = bsf64(gt) / MOVEMASK_HACK + j;
 
-                        // Copy entire vectors' worth of values at a time,
+                        // Copy an entire vectors' worth of values at a time,
                         // possibly past the end of the array (we should have
-                        // enough space)
+                        // enough space). We additionally copy over this state's
+                        // starting index, propagating it to all of its next states.
                         VE *from = &edge_values[c][start];
                         VE *to = &next_states[*next_n_states];
+                        uint32_t *to_idx = &next_start_idx[*next_n_states];
                         for (uint32_t x = start; x < end;
-                                x += N_VE, from += N_VE, to += N_VE)
+                                x += N_VE, from += N_VE, to += N_VE) {
                             *(V *)to = *(V *)from;
+
+                            // Weird loop thing: if our main NFA states are only
+                            // stored in one or two bytes, it takes more vector writes
+                            // to copy our start index over to all the next states
+                            for (uint32_t x_i = 0; x_i < sizeof(uint32_t) / sizeof(VE);
+                                    x_i++, to_idx += (VL / sizeof(uint32_t)))
+                                *(V *)to_idx = start_idx_vec;
+                        }
 
                         // Update the index to reflect only the valid values
                         (*next_n_states) += end - start;
@@ -584,8 +651,11 @@ public:
                 }
 skip:           ;
             }
+
+            // Flip the double buffers for the next iteration
             std::swap(states, next_states);
             std::swap(n_states, next_n_states);
+            std::swap(start_idx, next_start_idx);
         } while (*n_states && 
                 (FORWARDS ? ++input_p <= end : --input_p >= data));
 
