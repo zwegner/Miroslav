@@ -278,6 +278,12 @@ class _SIMDMatchVerifier {
     static const uint32_t N_VE = VI::VL / sizeof(VE);
     static const uint32_t MAX_STATES = (1 << 8 * sizeof(VE));
     static const uint32_t SENTINEL = MAX_STATES - 1;
+    // HACK: we divide by 2 when using 16 bit compares since there's no movemask_epi16
+    static const uint32_t MOVEMASK_HACK = sizeof(VE) == 2 ? 2 : 1;
+    // Another HACKish thing: for a masking operation deep in the algorithm, we
+    // need to mask out all the bits above the ones that might be set by a vcmpeq
+    // instruction. This should be all ones (thus a no-op) unless sizeof(VE) > 2.
+    static const vmask VCMP_BITS = (1 << N_VE * MOVEMASK_HACK) - 1;
 
     uint32_t key_count[256];
     VE *edge_keys[256];
@@ -303,7 +309,9 @@ public:
             // Sort the vector so all states that a given state/character combination
             // can lead to are all contiguous
             std::stable_sort(edge_pairs[i].begin(), edge_pairs[i].end(),
-                    [](const auto& a, const auto& b) { return a.k < b.k; });
+                    [](const auto& a, const auto& b) {
+                        return a.k < b.k || (a.k == b.k && a.v < b.v);
+                    });
 
             if (edge_pairs[i].size() == 0) {
                 edge_keys[i] = edge_values[i] = NULL;
@@ -350,20 +358,52 @@ public:
         // We have two state lists and switch between them like double buffering.
         // We keep a pointer to the current and next states, which we swap each
         // iteration.
-        VE _states[2][MAX_STATES];
+        VE _states[2][MAX_STATES * 4];
         uint32_t _n_states[2];
         VE *states = _states[0], *next_states = _states[1];
         uint32_t *n_states = &_n_states[0], *next_n_states = &_n_states[1];
 
         *n_states = 1;
         states[0] = END_STATE;
-        uint8_t c = *end;
         do {
+            uint8_t c = *end;
             *next_n_states = 0;
-            uint64_t seen = 0;
+
+            // Add a mask of already examined states this iteration, to skip
+            // duplicate states. We add the start state to the mask so we
+            // don't have an extra branch on every state--we only have to check
+            // for the start state inside the duplicate checking code
+            uint64_t seen = 1 << START_STATE;
+
             for (uint32_t s = 0; s < *n_states; s++) {
                 VE state = states[s];
                 V state_vec = broadcast<VI, VE>(state);
+
+                // Do a quick check for if we've already added this
+                // state by testing a mask against the low 6 bits
+                // of the state id, followed by a full slow check.
+                // XXX relies on variable shifts only looking at the low
+                // 6 bits
+                uint64_t mask = (uint64_t)1 << state;
+                if (seen & mask) {
+                    if (state == START_STATE)
+                        return end;
+
+                    uint32_t s_rounded = s & -N_VE;
+                    for (uint32_t i = 0; i < s_rounded; i += N_VE)
+                    {
+                        auto key = *(V *)&states[i];
+                        vmask eq = test_eq<VI, VE>(key, state_vec);
+                        if (eq)
+                            goto skip;
+                    }
+                    auto key = *(V *)&states[s_rounded];
+                    vmask eq = test_eq<VI, VE>(key, state_vec);
+                    if (eq & (1 << (s - s_rounded)) - 1)
+                        goto skip;
+                } else
+                    seen |= mask;
+
                 for (uint32_t i = 0; i < key_count[c]; i += N_VE) {
                     // Load VL contiguous key bytes into one vector, and
                     // compare the current state against all of them at once
@@ -373,48 +413,56 @@ public:
                     // If there was a match, there might be multiple
                     // predecessor states from this state/input byte. Since
                     // we sort the keys, we can just get the index of the
-                    // first match with bsf, and loop while the keys match.
-                    if (EXPECT(eq, 0)) {
-                        // HACK: we divide by sizeof(VE) since there's no movemask_epi16
-                        uint32_t start = bsf64(eq)/sizeof(VE) + i;
+                    // first index with a bitscan, find the last matches with
+                    // more vcmps and another bitscan, and copy all the bytes
+                    // in between at once.
+                    if (eq) {
+                        uint32_t start = bsf64(eq) / MOVEMASK_HACK + i;
 
-                        for (uint32_t x = start; edge_keys[c][x] == state; x++) {
-                            auto ns = edge_values[c][x];
+                        // Now that we have the start index, find the next
+                        // key that *isn't* equal to this state. We can
+                        // check for one within the same vector of keys that
+                        // the first key was in with a simple bitwise check:
+                        // all of the equal bits will be in one contiguous
+                        // group. If we add in the least significant bit of
+                        // the equality mask, we'll get a carry into the first
+                        // zero bit. If there aren't any unequal keys within
+                        // this vector after the equal keys, this addition
+                        // will overflow past the bits in the VCMP_BITS mask.
+                        vmask gt = eq + (eq & -eq);
+                        gt &= VCMP_BITS;
 
-                            // Check for reaching the start state, and return immediately
-                            if (ns == START_STATE)
-                                return end;
-
-                            // Do a quick check for if we've already added this
-                            // state by testing a mask against the low 6 bits
-                            // of the state id, followed by a full slow check.
-                            // XXX relies on variable shifts only looking at the low
-                            // 6 bits
-                            uint64_t mask = (uint64_t)1 << ns;
-                            if (EXPECT(seen & mask, 0)) {
-                                // XXX even this check could be vectorized, or at least
-                                // SWAR-ized
-                                for (uint32_t s2 = 0; s2 < *next_n_states; s2++)
-                                    if (next_states[s2] == ns)
-                                        goto skip;
-                            } else
-                                seen |= mask;
-
-                            next_states[(*next_n_states)++] = ns;
-skip:
-                            ;
+                        // Loop through the rest of the keys until we find
+                        // the first unequal key. We always store at least one
+                        // sentinel at the end, so we don't need to check the
+                        // length here
+                        uint32_t j = i;
+                        for (; !gt; j += N_VE) {
+                            auto key = *(V *)&edge_keys[c][j + N_VE];
+                            gt = ~test_eq<VI, VE>(key, state_vec);
                         }
+
+                        uint32_t end = bsf64(gt) / MOVEMASK_HACK + j;
+
+                        // Copy entire vectors' worth of values at a time,
+                        // possibly past the end of the array (we should have
+                        // enough space)
+                        VE *from = &edge_values[c][start];
+                        VE *to = &next_states[*next_n_states];
+                        for (uint32_t x = start; x < end;
+                                x += N_VE, from += N_VE, to += N_VE)
+                            *(V *)to = *(V *)from;
+
+                        // Update the index to reflect only the valid values
+                        (*next_n_states) += end - start;
+                        break;
                     }
                 }
+skip:           ;
             }
             std::swap(states, next_states);
             std::swap(n_states, next_n_states);
-        }
-        // Kinda tricky do/while loop condition: make sure there are still active
-        // NFA states, advance the pointer backwards, make sure it's still in
-        // bounds, read the next byte, and make sure there are predecessor states
-        // for that input byte
-        while (*n_states && --end >= data && key_count[(c = *end)]);
+        } while (*n_states && --end >= data);
 
         return NULL;
     }
