@@ -160,6 +160,47 @@ inline VecInfoAVX2::vmask test_eq<VecInfoAVX2, uint16_t>(
     return _mm256_movemask_epi8(_mm256_cmpeq_epi16(a, b));
 }
 
+// Lossy bitset. This works pretty much like a Bloom filter. For quickly
+// testing membership of a single index within the bitset, we look at
+// contiguous 6-bit chunks of the index value, and set a single bit within
+// the bitset based on that. For example, given the index 0xc68 (binary
+// 110001101000) and shifts of 0, 3, and 6, we get the following values:
+//
+//  1 1 0 0 0 1[1 0 1 0 0 0]  --> 101000 (40)
+//  1 1 0[0 0 1 1 0 1]0 0 0   --> 001101 (13)
+// [1 1 0 0 0 1]1 0 1 0 0 0   --> 110001 (49)
+//
+// So we test bit 40 in the first bitset, 13 in the second, and 49 in the
+// third. Only if all of these bits are set do we return true from
+// might_contain.
+//
+// Also note that this implementation depends on 64-bit variable shifts
+// being implicitly modulo 64, as they are on Intel chips...
+template<const uint32_t N_SHIFTS, const uint32_t SHIFTS[]>
+struct _LossyBitset {
+    uint64_t bitsets[N_SHIFTS];
+    _LossyBitset() : bitsets{0} {
+    }
+    void add(uint32_t index) {
+        for (uint32_t s = 0; s < N_SHIFTS; s++) {
+            uint32_t sub_index = index >> SHIFTS[s];
+            bitsets[s] |= 1 << sub_index;
+        }
+    }
+    bool might_contain(uint32_t index) {
+        for (uint32_t s = 0; s < N_SHIFTS; s++) {
+            uint32_t sub_index = index >> SHIFTS[s];
+            if (!(bitsets[s] & 1 << sub_index))
+                return false;
+        }
+        return true;
+    }
+};
+
+static constexpr uint32_t LBS_SHIFTS[] = {0, 4};
+static constexpr uint32_t N_LBS_SHIFTS = sizeof(LBS_SHIFTS) / sizeof(LBS_SHIFTS[0]);
+typedef _LossyBitset<N_LBS_SHIFTS, LBS_SHIFTS> LossyBitset;
+
 ////////////////////////////////////////////////////////////////////////////////
 // Match verifier
 // Since the vectorized matcher can give false positives, we have to run through
@@ -369,11 +410,12 @@ public:
             uint8_t c = *end;
             *next_n_states = 0;
 
-            // Add a mask of already examined states this iteration, to skip
-            // duplicate states. We add the start state to the mask so we
-            // don't have an extra branch on every state--we only have to check
-            // for the start state inside the duplicate checking code
-            uint64_t seen = 1 << START_STATE;
+            // Add a (lossy) bitset of already examined states this iteration,
+            // to skip duplicate states. We add the start state to the mask so
+            // we don't have an extra branch on every state--we only have to
+            // check for the start state inside the duplicate checking code.
+            LossyBitset seen;
+            seen.add(TARGET_STATE);
 
             for (uint32_t s = 0; s < *n_states; s++) {
                 VE state = states[s];
@@ -384,8 +426,7 @@ public:
                 // of the state id, followed by a full slow check.
                 // XXX relies on variable shifts only looking at the low
                 // 6 bits
-                uint64_t mask = (uint64_t)1 << state;
-                if (seen & mask) {
+                if (seen.might_contain(state)) {
                     if (state == START_STATE)
                         return end;
 
@@ -402,7 +443,7 @@ public:
                     if (eq & (1 << (s - s_rounded)) - 1)
                         goto skip;
                 } else
-                    seen |= mask;
+                    seen.add(state);
 
                 for (uint32_t i = 0; i < key_count[c]; i += N_VE) {
                     // Load VL contiguous key bytes into one vector, and
