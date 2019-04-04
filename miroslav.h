@@ -142,6 +142,10 @@ template<>
 inline VecInfoAVX2::V broadcast<VecInfoAVX2, uint16_t>(uint16_t value) {
     return _mm256_set1_epi16(value);
 }
+template<>
+inline VecInfoAVX2::V broadcast<VecInfoAVX2, uint32_t>(uint32_t value) {
+    return _mm256_set1_epi32(value);
+}
 
 // Test equal
 template<typename VI, typename element>
@@ -158,6 +162,11 @@ inline VecInfoAVX2::vmask test_eq<VecInfoAVX2, uint16_t>(
     // epi8 version, and in the one place test_eq is used now, we divide the
     // bitscan of this mask by 2.
     return _mm256_movemask_epi8(_mm256_cmpeq_epi16(a, b));
+}
+template<>
+inline VecInfoAVX2::vmask test_eq<VecInfoAVX2, uint32_t>(
+        VecInfoAVX2::V &a, VecInfoAVX2::V &b) {
+    return _mm256_movemask_ps(_mm256_cmpeq_epi32(a, b));
 }
 
 // Lossy bitset. This works pretty much like a Bloom filter. For quickly
@@ -316,19 +325,22 @@ class _SIMDMatchVerifier {
     typedef typename VI::vmask vmask;
     static const uint32_t VL = VI::VL;
 
-    static const uint32_t N_VE = VI::VL / sizeof(VE);
-    static const uint32_t MAX_STATES = (1 << 8 * sizeof(VE));
-    static const uint32_t SENTINEL = MAX_STATES - 1;
+    // Vector constants
+    static const uint64_t N_VE = VI::VL / sizeof(VE);
+    static const uint64_t MAX_STATES = ((uint64_t)1 << 8 * sizeof(VE));
+    static const uint64_t SENTINEL = MAX_STATES - 1;
     // HACK: we divide by 2 when using 16 bit compares since there's no movemask_epi16
-    static const uint32_t MOVEMASK_HACK = sizeof(VE) == 2 ? 2 : 1;
+    static const uint64_t MOVEMASK_HACK = sizeof(VE) == 2 ? 2 : 1;
     // Another HACKish thing: for a masking operation deep in the algorithm, we
     // need to mask out all the bits above the ones that might be set by a vcmpeq
     // instruction. This should be all ones (thus a no-op) unless sizeof(VE) > 2.
-    static const vmask VCMP_BITS = (1 << N_VE * MOVEMASK_HACK) - 1;
+    static const vmask VCMP_BITS = ~(-1 << N_VE * MOVEMASK_HACK);
 
     uint32_t key_count[256];
     VE *edge_keys[256];
     VE *edge_values[256];
+
+    VE *_state_buffer[2];
 
 public:
     _SIMDMatchVerifier(NFAEdgeList &edges) {
@@ -341,10 +353,12 @@ public:
         uint8_t c;
         uint32_t from, to;
         FOR_EACH_EDGE(c, from, to, edges) {
-            assert(from < SENTINEL);
-            assert(to < SENTINEL);
+            assert((uint64_t)from < SENTINEL);
+            assert((uint64_t)to < SENTINEL);
             edge_pairs[c].push_back(kv_pair(to, from));
         }
+
+        uint32_t max_concurrent_states = 0;
 
         for (uint32_t i = 0; i < 256; i++) {
             // Sort the vector so all states that a given state/character combination
@@ -383,7 +397,21 @@ public:
                 edge_keys[i][j] = SENTINEL;
                 edge_values[i][j] = SENTINEL;
             }
+
+            // Update the # of max concurrent states. Since we fill in the state
+            // buffer only with values from reading the edge_values[] array for
+            // a single input character, the maximum length of one of these arrays
+            // is an upper bound for the number of states that this NFA can
+            // possibly be in at once.
+            if (key_count[i] * N_VE > max_concurrent_states)
+                max_concurrent_states = key_count[i] * N_VE;
         }
+
+        // Allocate two buffers for storing the current states
+        // +64 because we can write past the end of this array
+        size_t buf_size = max_concurrent_states * sizeof(VE) + 64;
+        _state_buffer[0] = (VE *)malloc(buf_size);
+        _state_buffer[1] = (VE *)malloc(buf_size);
     }
 
     ~_SIMDMatchVerifier() {
@@ -393,15 +421,16 @@ public:
                 free(edge_values[i]);
             }
         }
+        free(_state_buffer[0]);
+        free(_state_buffer[1]);
     }
 
     const uint8_t *verify(const uint8_t *data, const uint8_t *end) {
         // We have two state lists and switch between them like double buffering.
         // We keep a pointer to the current and next states, which we swap each
         // iteration.
-        VE _states[2][MAX_STATES * 4];
+        VE *states = _state_buffer[0], *next_states = _state_buffer[1];
         uint32_t _n_states[2];
-        VE *states = _states[0], *next_states = _states[1];
         uint32_t *n_states = &_n_states[0], *next_n_states = &_n_states[1];
 
         *n_states = 1;
