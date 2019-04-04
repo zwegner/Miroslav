@@ -318,12 +318,24 @@ typedef BasicMatchVerifier<StateInfo32> BasicMatchVerifier32;
 typedef BasicMatchVerifier<StateInfo64> BasicMatchVerifier64;
 typedef BasicMatchVerifier<StateInfo128> BasicMatchVerifier128;
 
-template<class VI, typename VE>
-class _SIMDMatchVerifier {
+// Dumb empty class. Using SIMDMatcher as a verifier doesn't need a handler, so we
+// use this type as a placeholder
+struct DummyMatchHandler {
+    typedef uint32_t return_type;
+    void handle_match(UNUSED File &f, UNUSED const uint8_t *start,
+            UNUSED const uint8_t *end) {
+    }
+};
+
+template<class VI, typename VE, bool FORWARDS, bool CONTINUOUS, typename MatchHandler>
+class _SIMDMatcher {
     // Hacky substitute for "using"
     typedef typename VI::V V;
     typedef typename VI::vmask vmask;
     static const uint32_t VL = VI::VL;
+
+    static const uint32_t INITIAL_STATE = FORWARDS ? START_STATE : END_STATE;
+    static const uint32_t TARGET_STATE = FORWARDS ? END_STATE : START_STATE;
 
     // Vector constants
     static const uint64_t N_VE = VI::VL / sizeof(VE);
@@ -342,8 +354,18 @@ class _SIMDMatchVerifier {
 
     VE *_state_buffer[2];
 
+    // Stuff to act like a full regex matcher
+    MatchHandler &match_handler;
+    File *input_file;
+
 public:
-    _SIMDMatchVerifier(NFAEdgeList &edges) {
+    // Constructor wrapper using a cool NULL reference, for when using this class
+    // as a verifier (the handler isn't touched)
+    _SIMDMatcher(NFAEdgeList &edges) : _SIMDMatcher(edges, *(MatchHandler *)NULL) {
+        assert(!CONTINUOUS);
+    }
+
+    _SIMDMatcher(NFAEdgeList &edges, MatchHandler &handler) : match_handler(handler) {
         // Group NFA edges into vectors by character
         struct kv_pair {
             VE k, v;
@@ -355,7 +377,15 @@ public:
         FOR_EACH_EDGE(c, from, to, edges) {
             assert((uint64_t)from < SENTINEL);
             assert((uint64_t)to < SENTINEL);
-            edge_pairs[c].push_back(kv_pair(to, from));
+            assert(from != END_STATE);
+            assert(to != START_STATE);
+            // Add the from/to states into the associative array. Which is
+            // the key and which is the value depends on which direction
+            // we're going.
+            if (FORWARDS)
+                edge_pairs[c].push_back(kv_pair(from, to));
+            else
+                edge_pairs[c].push_back(kv_pair(to, from));
         }
 
         uint32_t max_concurrent_states = 0;
@@ -414,7 +444,7 @@ public:
         _state_buffer[1] = (VE *)malloc(buf_size);
     }
 
-    ~_SIMDMatchVerifier() {
+    ~_SIMDMatcher() {
         for (uint32_t i = 0; i < 256; i++) {
             if (key_count[i]) {
                 free(edge_keys[i]);
@@ -433,11 +463,26 @@ public:
         uint32_t _n_states[2];
         uint32_t *n_states = &_n_states[0], *next_n_states = &_n_states[1];
 
+        // For continuous operation, we will have the INITIAL_STATE always in
+        // the current state set. To do this easily, we just always keep it
+        // in the first position, and only write to entries after the first.
+        if (CONTINUOUS) {
+            states[0] = INITIAL_STATE;
+            next_states[0] = INITIAL_STATE;
+        }
+
         *n_states = 1;
-        states[0] = END_STATE;
+        states[0] = INITIAL_STATE;
+        const uint8_t *input_p = FORWARDS ? data : end;
         do {
-            uint8_t c = *end;
-            *next_n_states = 0;
+            uint8_t c = *input_p;
+
+            // CONTINUOUS mode has an implied initial state always at the 
+            // beginning of the buffer
+            if (CONTINUOUS)
+                *next_n_states = 1;
+            else
+                *next_n_states = 0;
 
             // Add a (lossy) bitset of already examined states this iteration,
             // to skip duplicate states. We add the start state to the mask so
@@ -450,14 +495,23 @@ public:
                 VE state = states[s];
                 V state_vec = broadcast<VI, VE>(state);
 
-                // Do a quick check for if we've already added this
-                // state by testing a mask against the low 6 bits
-                // of the state id, followed by a full slow check.
-                // XXX relies on variable shifts only looking at the low
-                // 6 bits
+                // Check for whether we've already added this state
                 if (seen.might_contain(state)) {
-                    if (state == START_STATE)
-                        return end;
+                    if (state == TARGET_STATE) {
+                        if (CONTINUOUS) {
+                            // XXX No start position yet
+                            match_handler.handle_match(*input_file, input_p-1, input_p);
+
+                            // Skip to the next newline, clear out all intermediate states
+                            while (input_p < end && *input_p != '\n')
+                                input_p++;
+
+                            *next_n_states = 1;
+
+                            break;
+                        } else
+                            return input_p;
+                    }
 
                     uint32_t s_rounded = s & -N_VE;
                     for (uint32_t i = 0; i < s_rounded; i += N_VE)
@@ -532,14 +586,29 @@ skip:           ;
             }
             std::swap(states, next_states);
             std::swap(n_states, next_n_states);
-        } while (*n_states && --end >= data);
+        } while (*n_states && 
+                (FORWARDS ? ++input_p <= end : --input_p >= data));
 
         return NULL;
     }
+
+    // Hacky method to run as a full matcher, not just verifier
+    typename MatchHandler::return_type run(File &f) {
+        match_handler.start();
+
+        assert(FORWARDS);
+        assert(CONTINUOUS);
+
+        input_file = &f;
+        verify(f.data, f.data + f.size - 1);
+
+        return match_handler.finish(f);
+    }
 };
 
-typedef _SIMDMatchVerifier<VEC_INFO, uint8_t> SIMDMatchVerifier8;
-typedef _SIMDMatchVerifier<VEC_INFO, uint16_t> SIMDMatchVerifier16;
+typedef _SIMDMatcher<VEC_INFO, uint8_t, false, false, DummyMatchHandler> SIMDMatchVerifier8;
+typedef _SIMDMatcher<VEC_INFO, uint16_t, false, false, DummyMatchHandler> SIMDMatchVerifier16;
+typedef _SIMDMatcher<VEC_INFO, uint32_t, false, false, DummyMatchHandler> SIMDMatchVerifier32;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Match handlers
