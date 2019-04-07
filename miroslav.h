@@ -327,15 +327,26 @@ struct DummyMatchHandler {
     }
 };
 
-template<class VI, typename VE, bool FORWARDS, bool CONTINUOUS, typename MatchHandler>
+struct MatcherRegexOpts {
+    static const bool FORWARDS = true;
+    static const bool CONTINUOUS = true;
+    static const bool OVERLAPPING = false;
+    static const bool ONE_PER_LINE = false;
+};
+
+struct VerifierRegexOpts {
+    static const bool FORWARDS = false;
+    static const bool CONTINUOUS = false;
+    static const bool OVERLAPPING = false;
+    static const bool ONE_PER_LINE = false;
+};
+
+template<typename VI, typename VE, typename Opts, typename MatchHandler>
 class _SIMDMatcher {
     // Hacky substitute for "using"
     typedef typename VI::V V;
     typedef typename VI::vmask vmask;
     static const uint32_t VL = VI::VL;
-
-    static const uint32_t INITIAL_STATE = FORWARDS ? START_STATE : END_STATE;
-    static const uint32_t TARGET_STATE = FORWARDS ? END_STATE : START_STATE;
 
     // Vector constants
     static const uint64_t N_VE = VI::VL / sizeof(VE);
@@ -364,11 +375,18 @@ class _SIMDMatcher {
     MatchHandler &match_handler;
     File *input_file;
 
+    static inline uint32_t INITIAL_STATE() {
+        return Opts::FORWARDS ? START_STATE : END_STATE;
+    }
+    static inline uint32_t TARGET_STATE() {
+        return Opts::FORWARDS ? END_STATE : START_STATE;
+    }
+
 public:
     // Constructor wrapper using a cool NULL reference, for when using this class
     // as a verifier (the handler isn't touched)
     _SIMDMatcher(NFAEdgeList &edges) : _SIMDMatcher(edges, *(MatchHandler *)NULL) {
-        assert(!CONTINUOUS);
+        assert(!Opts::CONTINUOUS);
     }
 
     _SIMDMatcher(NFAEdgeList &edges, MatchHandler &handler) : match_handler(handler) {
@@ -388,7 +406,7 @@ public:
             // Add the from/to states into the associative array. Which is
             // the key and which is the value depends on which direction
             // we're going.
-            if (FORWARDS)
+            if (Opts::FORWARDS)
                 edge_pairs[c].push_back(kv_pair(from, to));
             else
                 edge_pairs[c].push_back(kv_pair(to, from));
@@ -473,9 +491,7 @@ public:
     }
 
     const uint8_t *verify(const uint8_t *data, const uint8_t *end) {
-        // We have two state lists and switch between them like double buffering.
-        // We keep a pointer to the current and next states, which we swap each
-        // iteration.
+        // We have two state lists, which we switch between a la double buffering.
         VE *states = _state_buffer[0], *next_states = _state_buffer[1];
         uint32_t _n_states[2];
         uint32_t *n_states = &_n_states[0], *next_n_states = &_n_states[1];
@@ -487,23 +503,24 @@ public:
         // For continuous operation, we will have the INITIAL_STATE always in
         // the current state set. To do this easily, we just always keep it
         // in the first position, and only write to entries after the first.
-        if (CONTINUOUS) {
-            states[0] = INITIAL_STATE;
-            next_states[0] = INITIAL_STATE;
+        if (Opts::CONTINUOUS) {
+            states[0] = INITIAL_STATE();
+            next_states[0] = INITIAL_STATE();
         }
 
-        const uint8_t *input_p = FORWARDS ? data : end;
+        const uint8_t *input_p = Opts::FORWARDS ? data : end;
 
         *n_states = 1;
-        states[0] = INITIAL_STATE;
-        start_idx[0] = input_p - data + (FORWARDS ? -1 : 1);
+        states[0] = INITIAL_STATE();
+        start_idx[0] = input_p - data + (Opts::FORWARDS ? -1 : 1);
 
         do {
+start:
             uint8_t c = *input_p;
 
             // CONTINUOUS mode has an implied initial state always at the 
             // beginning of the buffer
-            if (CONTINUOUS) {
+            if (Opts::CONTINUOUS) {
                 *next_n_states = 1;
                 next_start_idx[0] = input_p - data;
             } else
@@ -514,7 +531,7 @@ public:
             // we don't have an extra branch on every state--we only have to
             // check for the start state inside the duplicate checking code.
             LossyBitset seen;
-            seen.add(TARGET_STATE);
+            seen.add(TARGET_STATE());
 
             for (uint32_t s = 0; s < *n_states; s++) {
                 VE state = states[s];
@@ -524,42 +541,62 @@ public:
                 // Check for whether we've already added this state
                 if (seen.might_contain(state)) {
                     // We found a match! We added the target state to the
-                    // seen bitset so we can only do this test in the
+                    // seen bitset so we only have to do this test in the
                     // slow path.
-                    if (state == TARGET_STATE) {
-                        // Continuous case: pass the match off to the match
-                        // handler and continue
-                        if (CONTINUOUS) {
-                            // Register the match. We have to do a bit of
-                            // index math to make the start/end points line
-                            // up correctly in both the forwards and backwards
-                            // cases. Why would we be streaming backwards? Who
-                            // the hell knows?
-                            if (FORWARDS)
-                                match_handler.handle_match(*input_file,
-                                        data + start_idx[s] + 1, input_p - 1);
-                            else
-                                match_handler.handle_match(*input_file,
-                                        input_p + 1, data + start_idx[s] - 1);
+                    if (state == TARGET_STATE()) {
+                        // Non-continuous case: we were just verifying that there was
+                        // a match. Oh hey, looks like there was one.
+                        if (!Opts::CONTINUOUS)
+                            return input_p;
 
-                            // Skip to the next newline, clear out all intermediate states
-                            // XXX this should be templated or something
-                            if (FORWARDS)
+                        // Continuous case: pass the match off to the match
+                        // handler and keep going
+
+                        // Register the match. We have to do a bit of
+                        // index math to make the start/end points line
+                        // up correctly in both the forwards and backwards
+                        // cases. Why would we be streaming backwards? Who
+                        // the hell knows?
+                        if (Opts::FORWARDS)
+                            match_handler.handle_match(*input_file,
+                                    data + start_idx[s] + 1, input_p - 1);
+                        else
+                            match_handler.handle_match(*input_file,
+                                    input_p + 1, data + start_idx[s] - 1);
+
+                        // Skip to the next newline if we only care about
+                        // one match per line
+                        if (Opts::ONE_PER_LINE) {
+                            if (Opts::FORWARDS)
                                 while (input_p < end && *input_p != '\n')
                                     input_p++;
                             else
                                 while (input_p >= data && *input_p != '\n')
                                     input_p--;
 
-                            *next_n_states = 1;
                             next_start_idx[0] = input_p - data;
 
+                            // Reset all states for the next iteration except
+                            // the initial state (always at slot 0). Then
+                            // break to go on to the next character.
+                            *next_n_states = 1;
                             break;
                         }
-                        // Non-continuous case: we were just verifying that there was
-                        // a match. Oh hey, looks like there was one.
-                        else
-                            return input_p;
+
+                        // If we allow overlapping matches, continue on to
+                        // the next state--all states that are in flight
+                        // are still valid and need to be processed.
+                        if (Opts::OVERLAPPING)
+                            continue;
+
+                        // No overlapping: any match that started before
+                        // this character can be thrown away. *But* we need
+                        // to process this character again from the start
+                        // state. So reset the states to just the initial
+                        // state, and go to the start
+                        // XXX this is ugly
+                        *n_states = 1;
+                        goto start;
                     }
 
                     // We potentially have a duplicate state. Since the state could
@@ -575,6 +612,7 @@ public:
                         if (eq)
                             goto skip;
                     }
+
                     // Compare the last set of states before this one. We
                     // compare all of them, but only test the bits below
                     // the one corresponding to this state.
@@ -657,7 +695,7 @@ skip:           ;
             std::swap(n_states, next_n_states);
             std::swap(start_idx, next_start_idx);
         } while (*n_states && 
-                (FORWARDS ? ++input_p <= end : --input_p >= data));
+                (Opts::FORWARDS ? ++input_p <= end : --input_p >= data));
 
         return NULL;
     }
@@ -666,8 +704,7 @@ skip:           ;
     typename MatchHandler::return_type run(File &f) {
         match_handler.start();
 
-        assert(FORWARDS);
-        assert(CONTINUOUS);
+        assert(Opts::CONTINUOUS);
 
         input_file = &f;
         verify(f.data, f.data + f.size - 1);
@@ -676,9 +713,9 @@ skip:           ;
     }
 };
 
-typedef _SIMDMatcher<VEC_INFO, uint8_t, false, false, DummyMatchHandler> SIMDMatchVerifier8;
-typedef _SIMDMatcher<VEC_INFO, uint16_t, false, false, DummyMatchHandler> SIMDMatchVerifier16;
-typedef _SIMDMatcher<VEC_INFO, uint32_t, false, false, DummyMatchHandler> SIMDMatchVerifier32;
+typedef _SIMDMatcher<VEC_INFO, uint8_t, VerifierRegexOpts, DummyMatchHandler> SIMDMatchVerifier8;
+typedef _SIMDMatcher<VEC_INFO, uint16_t, VerifierRegexOpts, DummyMatchHandler> SIMDMatchVerifier16;
+typedef _SIMDMatcher<VEC_INFO, uint32_t, VerifierRegexOpts, DummyMatchHandler> SIMDMatchVerifier32;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Match handlers
