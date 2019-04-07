@@ -757,52 +757,92 @@ public:
 // Basic grep-style handling: print out the full line, ignore other matches
 // on the same line. We support counting matching lines and printing the path.
 class MatchHandlerPrintLine {
-    uint32_t _match_count;
-    const uint8_t *_last_match_line;
-    bool _print_path;
-    bool _print_matches;
-    bool _print_count;
+    bool print_path;
+    bool print_matches;
+    bool print_count;
+    bool print_colors;
+    uint32_t match_count;
+    const uint8_t *current_match_end;
+    const uint8_t *current_line_end;
 
 public:
-    typedef void return_type;
+    typedef uint32_t return_type;
 
-    MatchHandlerPrintLine(bool print_path, bool print_matches, bool print_count) {
-        _print_path = print_path;
-        _print_matches = print_matches;
-        _print_count = print_count;
-    }
+    MatchHandlerPrintLine(bool print_path, bool print_matches, bool print_count,
+            bool print_colors) : print_path(print_path), print_matches(print_matches),
+            print_count(print_count), print_colors(print_colors) { }
 
     void start() {
-        _match_count = 0;
-        _last_match_line = NULL;
+        match_count = 0;
+        current_match_end = NULL;
+        current_line_end = NULL;
     }
 
-    void handle_match(File &f, const uint8_t *start, const uint8_t *end) {
-        // We only care about one match per line for printing/counting
-        // purposes. If this match is on the same line as the last, just skip it.
-        if (start < _last_match_line)
-            return;
+    inline void flush_line() {
+        if (print_matches && current_match_end) {
+            std::string ending(current_match_end + 1, current_line_end);
+            std::cout << ending << "\n";
+            current_match_end = NULL;
+        }
+    }
 
-        const uint8_t *last_nl = skip_chr(start, '\n', false, f.data);
-        const uint8_t *next_nl = skip_chr(end, '\n', true, f.data + f.size);
+    inline void handle_match(File &f, const uint8_t *start, const uint8_t *end) {
+        const uint8_t *pre_match;
 
-        if (_print_matches) {
-            if (_print_path)
+        // Is this match on a new line? If so, we possibly need to flush the last
+        // part of the last match, and then print the beginning of this line
+        // XXX this doesn't work for the backwards matching case, which
+        // REALLY REALLY MATTERS
+        if (start >= current_line_end) {
+            flush_line();
+
+            pre_match = skip_chr(start, '\n', false, f.data);
+            current_line_end = skip_chr(end, '\n', true, f.data + f.size);
+            if (print_path)
                 std::cout << f.path << ":";
-            std::string m(last_nl + 1, next_nl);
-            std::cout << m << "\n";
+        }
+        // Otherwise, we print out everything after the end of the last match
+        // first
+        else {
+            pre_match = current_match_end;
+            // Weird overlapping case--only happens when we allow overlapping
+            // matches
+            if (pre_match >= start)
+                start = pre_match + 1;
         }
 
-        _match_count++;
-        _last_match_line = next_nl;
+        // Print out everything on this line (or after the last match) leading
+        // up to this match, and then print this match, optionally with ANSI
+        // color highlighting
+        if (print_matches) {
+            // These strings have additional copies that are kind of annoying
+            std::string begin(pre_match + 1, start);
+            std::string mid(start, end + 1);
+
+            if (print_colors)
+                std::cout << begin << "\033[31;40m" << mid
+                    << "\033[0m";
+            else
+                std::cout << begin << mid;
+        }
+
+        match_count++;
+
+        // Store where the last match ended. We will print the rest of the line
+        // later, either with more matches or not, and need to know where we
+        // stopped printing
+        current_match_end = end;
     }
 
     return_type finish(File &f) {
-        if (_print_count) {
-            if (_print_path)
+        flush_line();
+
+        if (print_count) {
+            if (print_path)
                 std::cout << f.path << ":";
-            std::cout << _match_count << "\n";
+            std::cout << match_count << "\n";
         }
+        return match_count;
     }
 };
 

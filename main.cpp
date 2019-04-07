@@ -90,7 +90,7 @@ int main(int argc, char **argv) {
     }
 
     bool print_path = (argc > 1);
-    MatchHandlerPrintLine mh(print_path, !print_count, print_count);
+    MatchHandlerPrintLine mh(print_path, !print_count, print_count, true);
 
     if (state <= 32)
         run<BasicMatchVerifier32>(argc, argv, edges, mh);
