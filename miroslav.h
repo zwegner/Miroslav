@@ -318,6 +318,19 @@ typedef BasicMatchVerifier<StateInfo32> BasicMatchVerifier32;
 typedef BasicMatchVerifier<StateInfo64> BasicMatchVerifier64;
 typedef BasicMatchVerifier<StateInfo128> BasicMatchVerifier128;
 
+// Find the next occurrence of 'chr' in the data stream before 'bound', and return
+// the pointer of the character after that. We can go in both directions.
+inline const uint8_t *skip_chr(const uint8_t *p, const uint8_t chr, bool forwards,
+        const uint8_t *bound) {
+    if (forwards)
+        while (p < bound && *p != chr)
+            p++;
+    else
+        while (p >= bound && *p != chr)
+            p--;
+    return p;
+}
+
 // Dumb empty class. Using Squamatus as a verifier doesn't need a handler, so we
 // use this type as a placeholder
 struct DummyMatchHandler {
@@ -567,12 +580,8 @@ start:
                         // Skip to the next newline if we only care about
                         // one match per line
                         if (Opts::ONE_PER_LINE) {
-                            if (Opts::FORWARDS)
-                                while (input_p < end && *input_p != '\n')
-                                    input_p++;
-                            else
-                                while (input_p >= data && *input_p != '\n')
-                                    input_p--;
+                            input_p = skip_chr(input_p, '\n', Opts::FORWARDS,
+                                    Opts::FORWARDS ? end : data);
 
                             next_start_idx[0] = input_p - data;
 
@@ -774,13 +783,8 @@ public:
         if (start < _last_match_line)
             return;
 
-        const uint8_t *last_nl = start;
-        while (last_nl >= f.data && *last_nl != '\n')
-            last_nl--;
-
-        const uint8_t *next_nl = end;
-        while (next_nl < f.data + f.size && *next_nl != '\n')
-            next_nl++;
+        const uint8_t *last_nl = skip_chr(start, '\n', false, f.data);
+        const uint8_t *next_nl = skip_chr(end, '\n', true, f.data + f.size);
 
         if (_print_matches) {
             if (_print_path)
