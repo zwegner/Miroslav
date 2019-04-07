@@ -318,7 +318,7 @@ typedef BasicMatchVerifier<StateInfo32> BasicMatchVerifier32;
 typedef BasicMatchVerifier<StateInfo64> BasicMatchVerifier64;
 typedef BasicMatchVerifier<StateInfo128> BasicMatchVerifier128;
 
-// Dumb empty class. Using SIMDMatcher as a verifier doesn't need a handler, so we
+// Dumb empty class. Using Squamatus as a verifier doesn't need a handler, so we
 // use this type as a placeholder
 struct DummyMatchHandler {
     typedef uint32_t return_type;
@@ -342,7 +342,7 @@ struct VerifierRegexOpts {
 };
 
 template<typename VI, typename VE, typename Opts, typename MatchHandler>
-class _SIMDMatcher {
+class _Squamatus {
     // Hacky substitute for "using"
     typedef typename VI::V V;
     typedef typename VI::vmask vmask;
@@ -385,11 +385,11 @@ class _SIMDMatcher {
 public:
     // Constructor wrapper using a cool NULL reference, for when using this class
     // as a verifier (the handler isn't touched)
-    _SIMDMatcher(NFAEdgeList &edges) : _SIMDMatcher(edges, *(MatchHandler *)NULL) {
+    _Squamatus(NFAEdgeList &edges) : _Squamatus(edges, *(MatchHandler *)NULL) {
         assert(!Opts::CONTINUOUS);
     }
 
-    _SIMDMatcher(NFAEdgeList &edges, MatchHandler &handler) : match_handler(handler) {
+    _Squamatus(NFAEdgeList &edges, MatchHandler &handler) : match_handler(handler) {
         // Group NFA edges into vectors by character
         struct kv_pair {
             VE k, v;
@@ -477,7 +477,7 @@ public:
         _start_buffer[1] = (uint32_t *)malloc(start_buf_size);
     }
 
-    ~_SIMDMatcher() {
+    ~_Squamatus() {
         for (uint32_t i = 0; i < 256; i++) {
             if (key_count[i]) {
                 free(edge_keys[i]);
@@ -713,9 +713,9 @@ skip:           ;
     }
 };
 
-typedef _SIMDMatcher<VEC_INFO, uint8_t, VerifierRegexOpts, DummyMatchHandler> SIMDMatchVerifier8;
-typedef _SIMDMatcher<VEC_INFO, uint16_t, VerifierRegexOpts, DummyMatchHandler> SIMDMatchVerifier16;
-typedef _SIMDMatcher<VEC_INFO, uint32_t, VerifierRegexOpts, DummyMatchHandler> SIMDMatchVerifier32;
+typedef _Squamatus<VEC_INFO, uint8_t, VerifierRegexOpts, DummyMatchHandler> SquamatusVerifier8;
+typedef _Squamatus<VEC_INFO, uint16_t, VerifierRegexOpts, DummyMatchHandler> SquamatusVerifier16;
+typedef _Squamatus<VEC_INFO, uint32_t, VerifierRegexOpts, DummyMatchHandler> SquamatusVerifier32;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Match handlers

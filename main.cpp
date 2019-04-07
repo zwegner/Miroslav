@@ -100,11 +100,9 @@ int main(int argc, char **argv) {
         run<BasicMatchVerifier128>(argc, argv, edges, mh);
     // SIMD verifier: only allow 2^n-1 states since we need an extra for a sentinel
     else if (state <= 255)
-        run<SIMDMatchVerifier8>(argc, argv, edges, mh);
+        run_miroslav<SquamatusVerifier8>(argc, argv, edges, mh);
     else if (state <= 65535)
-        run<SIMDMatchVerifier16>(argc, argv, edges, mh);
-    else {
-        std::cerr << "error: max states exceeded: " << state << "\n";
-        exit(1);
-    }
+        run_miroslav<SquamatusVerifier16>(argc, argv, edges, mh);
+    else
+        run_miroslav<SquamatusVerifier32>(argc, argv, edges, mh);
 }
