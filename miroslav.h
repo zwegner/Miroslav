@@ -193,13 +193,13 @@ struct _LossyBitset {
     void add(uint32_t index) {
         for (uint32_t s = 0; s < N_SHIFTS; s++) {
             uint32_t sub_index = index >> SHIFTS[s];
-            bitsets[s] |= 1 << sub_index;
+            bitsets[s] |= 1ull << sub_index;
         }
     }
     bool might_contain(uint32_t index) {
         for (uint32_t s = 0; s < N_SHIFTS; s++) {
             uint32_t sub_index = index >> SHIFTS[s];
-            if (!(bitsets[s] & 1 << sub_index))
+            if (!(bitsets[s] & 1ull << sub_index))
                 return false;
         }
         return true;
